@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "biobrain"
+version = "0.1.0"
+description = "Active Inference Architecture for ARC-AGI-3 — a symbolic bio-RL agent that wakes up in unfamiliar grid environments, learns the physics, and reasons its way to the puzzle's solution."
+authors = [{name = "Dennis Ramdass"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "numba>=0.60",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+arena = [
+    # The ARC-AGI-3 environment SDK. Install from the official repo:
+    #   pip install git+https://github.com/arcprize/ARC-AGI-3.git
+    # Required to actually run biobrain against the benchmark games.
+    # biobrain's core (brain library) does not require arc_agi.
+]
+
+[project.urls]
+Homepage = "https://github.com/dramdass/biobrain"
+
+[tool.setuptools.packages.find]
+include = ["biobrain*"]
+exclude = ["tests*", "bench*", "docs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
