@@ -1,11 +1,15 @@
-"""biobrain.salience — the curating / attending organ (the 8th component).
+"""biobrain.salience — the central representation-state-management organ.
 
-Per the phenomenological insight from playing ARC-AGI-3:
-  - Salience CURATES the small variable set the brain models
-  - Salience TRIGGERS finer perceptual attention at prediction failures
-  - Salience PRIORITIZES probe order ("guess most useful first")
+Per the phenomenology (user playing ARC-AGI-3): Salience is not a perception
+utility. It's the central organ that curates the modeled variable set,
+triggers finer perception at prediction failures, banks salient surprises,
+and proposes new predicate templates (observable first, latent fallback).
 
-This makes Salience cortically central, not a perception utility.
+Subsumes the prior Latent Inference module.
 """
-from biobrain.salience.salience import Salience, SalienceCurator
-__all__ = ["Salience", "SalienceCurator"]
+from biobrain.salience.salience import Salience  # legacy salience-mask utility
+from biobrain.salience.central import (
+    CentralSalience, BankedSurprise, AffordancePosterior, CuratedVariables,
+)
+__all__ = ["CentralSalience", "Salience",
+           "BankedSurprise", "AffordancePosterior", "CuratedVariables"]
