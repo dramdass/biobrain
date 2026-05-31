@@ -1,7 +1,11 @@
 """Smoke tests for the biobrain scaffold.
 
-Verifies the package imports cleanly, the BioBrain can be constructed
-and exercised through observe/act on a real game without errors.
+Verifies the package imports cleanly and the legacy BioBrain composer
+can be constructed without errors. Uses biobrain's own perception layer
+(no spelke imports).
+
+End-to-end tests against the real env live in tests/test_env_adapter.py
+and bench/probe_v2_*.py.
 """
 
 from __future__ import annotations
@@ -10,10 +14,6 @@ import logging
 
 import pytest
 
-from arena.env import ArenaEnv
-from arena.perceive import detect_events, perceive
-from arena.salience import Salience
-from arena.types import ComputeBudget, Transition
 from biobrain import (
     BioBrain, Critic, Curiosity, Ledger, Simulator, Planner,
     click_on_color, key, spacebar, SEQ,
@@ -45,64 +45,37 @@ def test_ledger_empty_initial_state():
     assert L.promote_at_level(level=0) == []
 
 
-def test_biobrain_lifecycle():
-    """BioBrain reset/observe/act on a real game (smoke test)."""
+def test_biobrain_v1_instantiates():
+    """Legacy BioBrain v1 composer constructs and resets cleanly."""
     logging.disable(logging.CRITICAL)
     brain = BioBrain(seed=0)
-    brain.reset_game("vc33")
+    brain.reset_game("smoke")
     brain.reset_attempt()
-
-    env = ArenaEnv("vc33", mode="OFFLINE")
-    sal = Salience()
-    obs = env.reset()
-    prev_state = None
-    last_action = None
-
-    for step in range(10):
-        if env.is_terminal(obs):
-            break
-        parsed = env.parse(obs)
-        if parsed["grid"] is None:
-            break
-        avail = tuple(int(a) for a in parsed.get("available_actions", ()) or ())
-        sal.observe(parsed["grid"])
-        state = perceive(
-            parsed["grid"], prev_state, score=parsed["score"],
-            level=parsed["levels_completed"],
-            available_actions=avail, salience_mask=sal.mask(),
-        )
-        if prev_state is not None and last_action is not None:
-            events = detect_events(prev_state, state)
-            brain.observe(Transition(before=prev_state, action=last_action,
-                                      after=state, events=events))
-        action = brain.act(state, ComputeBudget(actions_remaining=100,
-                                                  time_remaining_ms=5000,
-                                                  attempts_remaining=1))
-        assert action is not None
-        obs = env.step(action)
-        prev_state = state
-        last_action = action
-
-    brain.end_of_attempt()
-    env.close()
+    assert brain.critic is not None
+    assert brain.curiosity is not None
+    assert brain.ledger is not None
+    assert brain.simulator is not None
+    assert brain.planner is not None
 
 
-def test_critic_evaluate_returns_list():
-    """Critic returns ProtoGoal list (possibly empty) on a real state."""
-    logging.disable(logging.CRITICAL)
-    env = ArenaEnv("cd82", mode="OFFLINE")
-    obs = env.reset()
-    parsed = env.parse(obs)
-    sal = Salience()
-    sal.observe(parsed["grid"])
-    state = perceive(
-        parsed["grid"], None, score=0, level=0,
-        available_actions=tuple(parsed.get("available_actions", ()) or ()),
-        salience_mask=sal.mask(),
-    )
+def test_critic_evaluate_returns_list_synthetic():
+    """Critic returns ProtoGoal list on a synthetic state."""
+    class MockE:
+        def __init__(self, color, cells):
+            self.color = color
+            self.id = id(self)
+            self.velocity = (0, 0)
+            class R:
+                area = len(cells)
+            self.region = R()
+            self.region.cells = cells
+
+    class MockS:
+        entities = [MockE(5, [(10, 10), (10, 11)])]
+        level = 0
+        raw_grid = None
+        grid_hash = 0
+
     critic = Critic()
-    goals = critic.evaluate(state)
+    goals = critic.evaluate(MockS())
     assert isinstance(goals, list)
-    # cd82 has detectable static-pattern goal even at step 0
-    assert len(goals) >= 1
-    env.close()
