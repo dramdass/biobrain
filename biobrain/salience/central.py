@@ -168,6 +168,15 @@ class CentralSalience:
                   "count_up_color", "count_down_color",
                   "count_reached_zero_color", "count_first_appeared_color"):
             self.curated.activate(t)
+        # v0.3 — role discovery, fingerprint index, subgoal detection
+        from biobrain.salience.roles import RoleSignature
+        from biobrain.salience.fingerprint import RoleFingerprintIndex
+        from biobrain.salience.subgoals import SubgoalDetector
+        self._role_counters: dict = {}  # entity_id -> RoleSignature
+        self._role_assignments: dict = {}  # entity_id -> Role
+        self.fingerprint_index = RoleFingerprintIndex()
+        self._subgoal_detector = SubgoalDetector()
+        self._last_fingerprint = None  # cache for delta detection
 
     # ----------------------------------------------------------- lifecycle
 
@@ -186,11 +195,18 @@ class CentralSalience:
                   "total_entities", "level",
                   "any_motion", "any_change"):
             self.curated.activate(t)
+        self._role_counters = {}
+        self._role_assignments = {}
+        self.fingerprint_index.reset_game()
+        self._subgoal_detector.reset_game()
+        self._last_fingerprint = None
 
     def reset_attempt(self) -> None:
         # Keep modeled vars, banked surprises, affordance, schemas;
         # clear only the short-term attention queue.
         self._fine_attention_queue = set()
+        self._subgoal_detector.reset_attempt()
+        self._last_fingerprint = None
 
     def on_level_change(self, prev_level: int, new_level: int) -> None:
         # v0: no-op. v1: rebalance active variable set based on per-level
@@ -292,6 +308,121 @@ class CentralSalience:
 
     def get_affordance(self, action_kind: str) -> float:
         return self.affordance.posterior_mean(action_kind)
+
+    # ----------------------------------------------------- role machinery
+
+    def update_causal_counters(self, transition,
+                                n_cells_changed_elsewhere: int = 0) -> None:
+        """Update per-entity causal counters from one transition.
+
+        Called from BioBrainV2.observe(). Walks entities in before+after
+        states and updates their RoleSignature counters based on whether
+        they were clicked, whether they translated, whether they persist.
+        """
+        from biobrain.salience.roles import RoleSignature
+        before = transition.before
+        after = transition.after
+        action = transition.action
+        if before is None or after is None or action is None:
+            return
+        action_kind = action[0] if action else "unknown"
+
+        # Identify clicked entity (if any)
+        clicked_entity_id = None
+        if action_kind == "click" and len(action) >= 3:
+            x, y = int(action[1]), int(action[2])
+            for e in before.entities:
+                if (y, x) in e.region.cells:
+                    clicked_entity_id = e.id
+                    break
+
+        before_ids = {e.id: e for e in before.entities}
+        after_ids = {e.id: e for e in after.entities}
+
+        all_ids = set(before_ids) | set(after_ids)
+        for eid in all_ids:
+            sig = self._role_counters.setdefault(eid, RoleSignature())
+            sig.n_observations += 1
+
+            present_before = eid in before_ids
+            present_after = eid in after_ids
+
+            # Persistence (running fraction of transitions where entity present)
+            present = 1.0 if present_after else 0.0
+            sig.persistence = (sig.persistence * (sig.n_observations - 1)
+                                + present) / sig.n_observations
+
+            if eid == clicked_entity_id:
+                sig.clicked_on_count += 1
+                if not present_after:
+                    sig.was_removed_on_click += 1
+                elif present_before and present_after:
+                    e_b = before_ids[eid]
+                    e_a = after_ids[eid]
+                    if (e_b.color != e_a.color
+                            or e_b.region.cells != e_a.region.cells):
+                        sig.clicked_caused_self_change += 1
+                # RL-TODO: 5/50 thresholds are hand-set for "meaningful" deltas.
+                # Could be derived from per-game cell-change distribution.
+                if n_cells_changed_elsewhere >= 5:
+                    sig.clicked_caused_other_change += 1
+                if n_cells_changed_elsewhere >= 50:
+                    sig.clicked_caused_global_change += 1
+
+            if action_kind == "key" and present_before and present_after:
+                e_b = before_ids[eid]
+                e_a = after_ids[eid]
+                def _centroid(e):
+                    if not e.region.cells:
+                        return (0.0, 0.0)
+                    rs = [c[0] for c in e.region.cells]
+                    cs = [c[1] for c in e.region.cells]
+                    return (sum(rs) / len(rs), sum(cs) / len(cs))
+                cb = _centroid(e_b)
+                ca = _centroid(e_a)
+                if abs(cb[0] - ca[0]) + abs(cb[1] - ca[1]) > 0.5:
+                    sig.translated_under_key_count += 1
+
+    def refresh_role_assignments(self) -> None:
+        """For each tracked entity, assign the highest-likelihood role
+        (or UNKNOWN if undersampled). Called periodically — typically
+        once per observe().
+        """
+        from biobrain.salience.roles import assign_role
+        for eid, sig in self._role_counters.items():
+            self._role_assignments[eid] = assign_role(sig)
+
+    def current_fingerprint(self, state, quadrant_of) -> object:
+        """Compute the role-fingerprint of `state` given current role
+        assignments. `quadrant_of` is a callable entity -> int (0..15).
+        """
+        from biobrain.salience.fingerprint import compute_fingerprint
+        return compute_fingerprint(state.entities, self._role_assignments,
+                                    quadrant_of)
+
+    def detect_subgoal(self, fingerprint_before, fingerprint_after,
+                        action, critic_distance_dropped: bool,
+                        source_level: int, source_attempt_id: int) -> object:
+        """Run subgoal detector for this transition. Returns Subgoal or None.
+        Also stores discovered subgoals into the fingerprint index.
+        """
+        sg = self._subgoal_detector.observe_transition(
+            fingerprint_before=fingerprint_before,
+            fingerprint_after=fingerprint_after,
+            action=action,
+            critic_distance_dropped=critic_distance_dropped,
+            source_level=source_level,
+            source_attempt_id=source_attempt_id,
+        )
+        if sg is not None:
+            self.fingerprint_index.insert(sg.start_fp, sg)
+            self.fingerprint_index.insert(sg.end_fp, sg)
+        return sg
+
+    @property
+    def role_assignments(self) -> dict:
+        """Read-only view of current role assignments (entity_id -> Role)."""
+        return dict(self._role_assignments)
 
 
 __all__ = [
