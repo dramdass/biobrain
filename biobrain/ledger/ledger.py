@@ -112,12 +112,26 @@ class Ledger:
         """Track action history; on score event, abstract into a program.
 
         Returns the LedgerEntry that was created/updated, or None.
+
+        IMPORTANT: when a score event fires, the recorded score_level is
+        the BEFORE level (the level the program was running at when it
+        scored), NOT the AFTER level (the new level the brain just
+        entered). This is critical for cross-level promotion: a program
+        that "scored at level 0" should be promoted as a candidate for
+        levels 1, 2, etc. If we instead recorded score_level=1 (the
+        after level), the entry would be at the same level as the new
+        attempt and never get promoted as cross-level transfer.
         """
         if transition.before is not None and transition.action is not None:
             self._recent.append((transition.action, transition.before))
         scored = False
-        score_level = (transition.after.level if transition.after is not None
-                       else 0)
+        # Use the BEFORE level — the level the program ran at when it scored.
+        # Fall back to after if no before (initial-state edge case).
+        if transition.before is not None:
+            score_level = transition.before.level
+        else:
+            score_level = (transition.after.level
+                            if transition.after is not None else 0)
         for e in transition.events:
             if e.kind in (EVENT_SCORE_INCREASED, EVENT_LEVEL_INCREASED):
                 scored = True
@@ -134,14 +148,22 @@ class Ledger:
 
     def promote_at_level(self, level: int) -> list[tuple[Program, float, str]]:
         """Return (program, confidence, program_id) tuples for programs
-        with prior-level confidence ≥ promotion_threshold.
+        with ANY positive evidence at a prior level.
 
-        Sorted by confidence descending.
+        Sorted by confidence descending. No magic threshold — the brain
+        consumes this list and Thompson-samples among candidates,
+        which naturally weighs by confidence. The previous hard
+        threshold (0.7) excluded single-success programs (Beta(1,0) →
+        conf=0.67) which is exactly the case the scientific-method
+        loop is supposed to surface.
         """
         out: list[tuple[Program, float, str]] = []
         for entry in self._entries.values():
             conf = entry.max_other_level_confidence(level)
-            if conf >= self._promotion_threshold:
+            # Any positive evidence (conf > 0.5) means "tried at prior
+            # level, at least one positive outcome." Promote everything
+            # that has SOME signal; let Thompson at the consumer decide.
+            if conf > 0.5:
                 out.append((entry.program, conf, entry.program_id))
         out.sort(key=lambda x: -x[1])
         return out

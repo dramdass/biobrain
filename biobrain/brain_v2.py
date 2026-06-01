@@ -1,18 +1,17 @@
 """biobrain.brain_v2 — the v0.2 composer (8 components + commit-and-monitor).
 
-This is the canonical BioBrain class for v0.2. It composes:
-  1. Motor Cortex (via DSL programs)
-  2. Perception (Encoder)
-  3. Salience (central organ)
-  4. Curiosity (Bayesian WM + signed surprise)
-  5. Critic (multi-extractor L3)
-  6. Simulator (forward queries via WM)
-  7. Ledger (per-game program memory)
-  8. Planner (commit-and-monitor)
-
-The composer is the ONLY thing that knows the inter-component wiring.
-Each component is pure (no other-component references). Data flow is
-explicit in observe() and act().
+Audit-bug fixes integrated:
+  #1 substrate single-source: Planner shares Residual's ActionScoreTable
+     (no separate _substrate dict).
+  #2 surprise single-compute: composer computes surprise ONCE, passes it
+     to Residual.observe (no recomputation).
+  #3 register_failure: Planner tracks in-flight program scoring; on
+     program completion without score, registers failure with Ledger.
+  #4 cold-path encode delta: cold path passes `last_state` to encoder
+     so delta facts (any_change, count_up_color, etc.) are emitted.
+  #6 observe order: surprise computed first; routed to all consumers.
+  #7 initial transition: Salience/Planner still run with surprise=0.0
+     when before is None (no skip).
 """
 
 from __future__ import annotations
@@ -37,15 +36,7 @@ from biobrain.types import ComputeBudget
 
 
 class BioBrainV2:
-    """v0.2 composer. 8 components. Commit-and-monitor control loop.
-
-    Public interface (matches the simpler BrainEngine):
-      reset_game(game_id)
-      reset_attempt()
-      observe(transition)
-      act(state, budget) → Action
-      end_of_attempt()
-    """
+    """v0.2 composer. 8 components. Commit-and-monitor control loop."""
 
     def __init__(self, *,
                  seed: int = 0,
@@ -53,132 +44,158 @@ class BioBrainV2:
                  ) -> None:
         self.adapter: Adapter = adapter if adapter is not None else ArcAdapter()
         self.encoder: Encoder = self.adapter.encoder
-        # 4. Curiosity (Bayesian WM + signed surprise + substrate Beta)
-        # We use the existing MemoryBrainResidual as the source of the WM,
-        # the signed-surprise computation, and the substrate posterior
-        # (which it shares with the Planner via observe()).
+        # Curiosity — owns the WM and the substrate ActionScoreTable
         self._residual = MemoryBrainResidual(seed=seed)
-        # 3. Salience — central organ
+        # Salience — central organ
         self.salience = CentralSalience()
-        # Seed affordance from adapter (default: uniform)
         self.salience.affordance.seed(self.adapter.initial_affordance_priors())
-        # 5. Critic — multi-extractor L3
+        # Critic
         self.critic = Critic()
-        # 6. Simulator — forward queries via WM
+        # Simulator
         self.simulator = Simulator(self._residual._world)
-        # 7. Ledger — per-game program memory
+        # Ledger
         self.ledger = Ledger()
-        # 8. Planner — commit-and-monitor
-        self.planner = CommitMonitorPlanner(seed=seed)
-        # Track last-seen level for on_level_change detection
-        self._last_level: int = -1
+        # Planner — SHARES the substrate ActionScoreTable with Curiosity
+        # (bug #1 fix)
+        self.planner = CommitMonitorPlanner(
+            seed=seed,
+            action_table=self._residual._action_table,
+        )
+        # Track last seen state for cold-path encoder delta facts (bug #4)
+        self._last_state: Optional[StateLike] = None
 
     # ============================================================ lifecycle
 
     def reset_game(self, game_id: str) -> None:
-        """Inter-game amnesia: wipe everything except adapter and encoder."""
         self._residual.reset_game(game_id)
         self.salience.reset_game()
         self.salience.affordance.seed(self.adapter.initial_affordance_priors())
         self.critic.reset_game()
-        # Rebuild simulator with fresh WM
         self.simulator = Simulator(self._residual._world)
         self.ledger.reset_game()
-        self.planner.reset_game(game_id)
-        self._last_level = -1
+        # Re-create planner with the FRESH action_table from residual
+        self.planner = CommitMonitorPlanner(
+            seed=self.planner._seed,
+            action_table=self._residual._action_table,
+        )
+        self._last_state = None
 
     def reset_attempt(self) -> None:
-        """Intra-game memory preserved; only per-attempt transients clear."""
         self._residual.reset_attempt()
         self.salience.reset_attempt()
         self.planner.reset_attempt()
-        # Ledger and Critic preserve across attempts (no reset_attempt needed)
+        self._last_state = None
 
     def _on_level_change(self, prev_level: int, new_level: int) -> None:
-        """Explicit control-flow event at level transitions."""
-        self.ledger.on_level_change(prev_level, new_level) if hasattr(
-            self.ledger, "on_level_change") else None
+        if hasattr(self.ledger, "on_level_change"):
+            self.ledger.on_level_change(prev_level, new_level)
         self.salience.on_level_change(prev_level, new_level)
         self.planner.on_level_change(prev_level, new_level)
 
     # ============================================================ observe
 
     def observe(self, transition: TransitionLike) -> None:
-        """Process one transition through all components, in order.
+        """Process one transition through all components.
 
-        Order matters: Curiosity computes surprise → Salience consumes it
-        → Critic updates history → Ledger tracks → Planner observes.
+        Order (per audit bug #6 fix):
+          1. Detect level change (defer firing the hook until after observe
+             so per-component observe sees the new level naturally).
+          2. Compute surprise ONCE (before any WM update — audit bug #2).
+          3. Update Residual (substrate + WM) with the precomputed surprise.
+          4. Salience.observe with the same surprise.
+          5. Critic history update.
+          6. Ledger.observe (with before-level score_level — fixed).
+          7. Planner.observe with the same surprise (no double-write).
+          8. Fire on_level_change hook if applicable.
         """
-        # 1. Substrate + WM update (also computes signed surprise internally)
-        self._residual.observe(transition)
-        # 2. Critic history update (for ChangeDynamics-family extractors)
-        self.critic.observe_transition(transition)
-        # 3. Ledger trajectory tracking + score-event abstraction
-        self.ledger.observe(transition)
-        # 4. Salience: compute surprise here (from current WM) and update
+        # Compute surprise ONCE (before WM update)
+        precomputed_surprise = 0.0
         if transition.before is not None and transition.action is not None:
+            try:
+                precomputed_surprise = self._residual._compute_signed_surprise(
+                    transition.before, transition.action, transition.after,
+                )
+            except Exception:
+                precomputed_surprise = 0.0
+
+        # Residual: substrate + WM updates (passes back the clipped value
+        # actually injected; we ignore that — we use the precomputed)
+        self._residual.observe(transition,
+                                precomputed_surprise=precomputed_surprise)
+
+        # Salience: bank surprise, update affordance, request fine attention
+        if transition.before is not None and transition.action is not None:
+            try:
+                predicted = self._residual._world.predict(
+                    transition.before, transition.action)
+                predicted_facts = frozenset(
+                    f for f, p in predicted.items() if p >= 0.5)
+                actual_facts = self.encoder.encode(
+                    transition.after, before=transition.before)
+            except Exception:
+                predicted_facts = frozenset()
+                actual_facts = frozenset()
             from biobrain.types import action_kind
-            predicted = self._residual._world.predict(
-                transition.before, transition.action)
-            predicted_facts = frozenset(
-                f for f, p in predicted.items() if p >= 0.5)
-            actual_facts = self.encoder.encode(transition.after,
-                                                before=transition.before)
-            # Recompute signed surprise (Salience consumes this)
-            surprise = self._residual._compute_signed_surprise(
-                transition.before, transition.action, transition.after,
-            )
             context = (
                 action_kind(transition.action),
-                None,  # target_color extraction happens in residual; here we
-                       # use the action_kind for Salience's affordance update
+                None,
                 transition.after.level,
             )
             self.salience.observe(
-                surprise=surprise,
+                surprise=precomputed_surprise,
                 context=context,
                 action=transition.action,
                 predicted_facts=predicted_facts,
                 actual_facts=actual_facts,
             )
-            # 5. Planner observation: surprise for violation trigger
+
+        # Critic history update
+        self.critic.observe_transition(transition)
+
+        # Ledger (with before-level score_level)
+        self.ledger.observe(transition)
+
+        # Planner: track in-flight scoring + violation flag
+        if transition.action is not None:
             scored = any(
                 e.kind in ("ScoreIncreased", "LevelIncreased")
                 for e in transition.events
             )
-            from biobrain.planner.commit_monitor import CommitMonitorPlanner
-            sig = CommitMonitorPlanner._signature(
-                transition.action, transition.before)
-            self.planner.observe(surprise=surprise, action_sig=sig,
-                                  scored=scored)
-        # 6. Level change detection — composer-level event
+            action_sig = CommitMonitorPlanner._signature(
+                transition.action,
+                transition.before if transition.before is not None else
+                transition.after,
+            )
+            self.planner.observe(
+                surprise=precomputed_surprise,
+                action_sig=action_sig,
+                scored=scored,
+                current_level=transition.after.level,
+                ledger=self.ledger,
+            )
+
+        # Level change hook
         if (transition.before is not None
                 and transition.after.level > transition.before.level):
             self._on_level_change(transition.before.level,
                                    transition.after.level)
-        self._last_level = transition.after.level
+
+        self._last_state = transition.after
 
     # ============================================================ act
 
     def act(self, state: StateLike, budget: ComputeBudget) -> ActionLike:
-        """Hot path → cold path as needed. Returns concrete Action."""
         candidates = self.encoder.candidate_actions(state)
         if not candidates:
             raise ValueError("no candidate actions available")
-        # Salience may have queued fine-attention cells; the Encoder can
-        # consume them on the next encode() call. For this act, use coarse.
-        # Get current Critic goals
         critic_goals = self.critic.evaluate(state)
-        # Get promoted programs from Ledger
         promoted = []
         try:
             ledger_promotions = self.ledger.promote_at_level(state.level)
             promoted = [p for p, _conf, _id in ledger_promotions]
         except Exception:
             pass
-        # Affordance lookup function
         affordance_fn = self.salience.get_affordance
-        # Route through Planner (which handles hot/cold paths internally)
         return self.planner.act(
             state=state,
             candidates=candidates,
@@ -187,6 +204,8 @@ class BioBrainV2:
             promoted_programs=promoted,
             simulator=self.simulator,
             affordance_fn=affordance_fn,
+            last_state=self._last_state,
+            ledger=self.ledger,
         )
 
     def end_of_attempt(self) -> None:

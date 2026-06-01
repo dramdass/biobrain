@@ -29,6 +29,7 @@ import random
 from typing import Optional
 
 from biobrain.curiosity.residual import SURPRISE_CLIP
+from biobrain.planner.posterior import ActionScoreTable
 from biobrain.protocols import ActionLike, StateLike
 from biobrain.motor_cortex.core import Program
 
@@ -40,33 +41,42 @@ VIOLATION_SURPRISE_THRESHOLD = 0.35
 class CommitMonitorPlanner:
     """Event-driven Planner. Commits programs; monitors for violations.
 
-    Three-path control:
-      - hot_step(state, candidates, encoder): step in-flight program; if
-        none or violation pending, escalate to cold.
-      - cold_step(state, ...): full reasoning; commit a Program; step it.
-      - observe(surprise, transition): set violation flag if surprise
-        exceeds threshold; update substrate.
+    Sharing the substrate posterior with Curiosity (Residual): we no longer
+    maintain a separate _substrate dict. The composer passes the shared
+    ActionScoreTable at construction time. This fixes audit bug #1
+    (split-substrate) — there is ONE source of truth for the action-
+    signature Beta posterior.
 
-    State:
-      - in-flight Program continuation
-      - violation pending flag
-      - substrate posterior (action-signature → Beta)
-      - random generator (Thompson)
+    Three-path control:
+      - hot path: step in-flight Program; if none or violation pending,
+        escalate to cold path.
+      - cold path: full reasoning; commit a Program; step it.
+      - observe(surprise, action_sig, scored): set violation flag if
+        surprise exceeds threshold. The substrate posterior is updated
+        UPSTREAM in MemoryBrainResidual.observe (so we don't double-write).
+        If a committed Program completes without scoring, register its
+        failure with the Ledger.
     """
 
     def __init__(self, *,
                  seed: int = 0,
                  violation_threshold: float = VIOLATION_SURPRISE_THRESHOLD,
+                 action_table: ActionScoreTable | None = None,
                  ) -> None:
         self._rng = random.Random(seed)
         self._seed = seed
         self._in_flight: Optional[Program] = None
         self._in_flight_id: Optional[str] = None
+        # Track per-in-flight-program metadata for register_failure (bug #3)
+        self._in_flight_start_level: int = 0
+        self._in_flight_scored: bool = False
         self._violation_pending: bool = False
         self._violation_threshold = violation_threshold
-        # Substrate posterior: (action_sig) → (n_obs, n_goal)
-        self._substrate: dict[tuple, tuple[float, float]] = {}
-        # Track when we last entered cold path (for diagnostics)
+        # Shared substrate posterior — passed by composer. If None,
+        # we create our own (standalone usage / tests).
+        self._action_table = action_table if action_table is not None \
+            else ActionScoreTable()
+        # Diagnostic counters
         self._n_cold_calls = 0
         self._n_hot_calls = 0
 
@@ -75,42 +85,57 @@ class CommitMonitorPlanner:
     def reset_game(self, game_id: str) -> None:
         self._in_flight = None
         self._in_flight_id = None
+        self._in_flight_start_level = 0
+        self._in_flight_scored = False
         self._violation_pending = False
-        self._substrate = {}
         self._rng = random.Random(self._seed)
         self._n_cold_calls = 0
         self._n_hot_calls = 0
+        # NOTE: we do NOT reset the action_table here — that's owned by
+        # the composer (shared with Residual). Composer's reset_game
+        # handles it via residual.reset_game().
 
     def reset_attempt(self) -> None:
-        # Wipe in-flight program (can't continue across attempts); keep substrate
+        # Wipe in-flight program (can't continue across attempts);
+        # substrate carries (it lives in residual._action_table)
         self._in_flight = None
         self._in_flight_id = None
+        self._in_flight_scored = False
         self._violation_pending = False
 
     def on_level_change(self, prev_level: int, new_level: int) -> None:
         # Abandon in-flight program at level boundary
         self._in_flight = None
         self._in_flight_id = None
+        self._in_flight_scored = False
         self._violation_pending = True  # force cold-path on next act
 
     # ----------------------------------------------------------- observe
 
     def observe(self, surprise: float, action_sig: tuple,
-                scored: bool) -> None:
-        """Update substrate posterior; set violation flag if surprise high."""
-        # Substrate update — same pattern as residual injection
-        n_obs, n_goal = self._substrate.get(action_sig, (0.0, 0.0))
+                scored: bool, current_level: int = 0,
+                ledger=None) -> None:
+        """Update violation flag; track in-flight program scoring.
+
+        Substrate update is handled UPSTREAM in MemoryBrainResidual.observe
+        (single source of truth). This method:
+          1. Tracks whether the in-flight program scored.
+          2. If a program completes without scoring across multiple steps,
+             registers failure with the Ledger.
+          3. Sets violation flag on surprise spike.
+
+        Note: action_sig is kept for backward compat / diagnostics; the
+        substrate update happens elsewhere now.
+        """
         if scored:
-            self._substrate[action_sig] = (n_obs, n_goal + 1.0)
-        else:
-            clipped = max(-SURPRISE_CLIP, min(SURPRISE_CLIP, surprise))
-            if clipped >= 0:
-                self._substrate[action_sig] = (n_obs, n_goal + clipped)
-            else:
-                self._substrate[action_sig] = (n_obs + (-clipped), n_goal)
+            self._in_flight_scored = True
         # Violation detection — gate cold-path re-engagement
         if abs(surprise) >= self._violation_threshold:
             self._violation_pending = True
+        # Track current level for register_failure on program completion
+        self._current_level = current_level
+        # Stash ledger reference for use when in-flight program completes
+        self._ledger_ref = ledger
 
     # ----------------------------------------------------------- act paths
 
@@ -122,6 +147,8 @@ class CommitMonitorPlanner:
             promoted_programs: Optional[list] = None,
             simulator=None,
             affordance_fn=None,
+            last_state: Optional[StateLike] = None,
+            ledger=None,
             ) -> ActionLike:
         """Single entry point. Routes to hot or cold path based on state.
 
@@ -135,18 +162,54 @@ class CommitMonitorPlanner:
             action = encoder.resolve(sig, state, candidates)
             if action is not None:
                 if next_prog is None:
-                    # Program completed — next act will go cold
+                    # Program completed. Register success or failure with Ledger
+                    # depending on whether any score event fired during execution.
+                    self._on_program_complete(ledger=ledger or
+                                                getattr(self, "_ledger_ref", None),
+                                                current_level=state.level)
                     self._in_flight = None
                     self._in_flight_id = None
                 return action
             # Couldn't resolve → abandon program, fall through to cold
+            self._on_program_complete(ledger=ledger or
+                                        getattr(self, "_ledger_ref", None),
+                                        current_level=state.level,
+                                        was_aborted=True)
             self._in_flight = None
             self._in_flight_id = None
 
         # COLD path: full reasoning
         return self._cold_path(state, candidates, encoder,
                                 critic_goals, promoted_programs,
-                                simulator, affordance_fn)
+                                simulator, affordance_fn, last_state, ledger)
+
+    def _on_program_complete(self, ledger, current_level: int,
+                              was_aborted: bool = False) -> None:
+        """Bug #3 fix: register_failure when committed Program ends without score.
+
+        Called when the in-flight Program returns next_program=None (natural
+        completion) or when resolution fails (was_aborted=True). If the
+        program produced ANY score event during its execution, we count
+        that as success (no failure registration). Otherwise: register
+        failure at the level the program was running at, so the Ledger's
+        per-level Beta gets the negative evidence and promotion will be
+        less confident next time.
+        """
+        if ledger is None or self._in_flight_id is None:
+            return
+        if self._in_flight_scored:
+            # Program achieved a score event during execution → no failure.
+            self._in_flight_scored = False
+            return
+        # Look up the program_id by object id (best-effort)
+        try:
+            for entry in ledger.all_entries():
+                if id(entry.program) == self._in_flight_id:
+                    ledger.register_failure(entry.program_id,
+                                             self._in_flight_start_level)
+                    break
+        except Exception:
+            pass
 
     def _cold_path(self,
                     state: StateLike,
@@ -156,6 +219,8 @@ class CommitMonitorPlanner:
                     promoted_programs: Optional[list],
                     simulator,
                     affordance_fn,
+                    last_state: Optional[StateLike] = None,
+                    ledger=None,
                     ) -> ActionLike:
         """Full reasoning: Thompson + Critic + Simulator + Ledger + Affordance."""
         self._n_cold_calls += 1
@@ -163,26 +228,68 @@ class CommitMonitorPlanner:
         if not candidates:
             raise ValueError("No candidate actions")
 
-        # 1. Try promoted programs first (Ledger)
+        # 1. Try promoted programs via Thompson over substrate-Beta.
+        # We DON'T pick first-takes-all — that over-commits to prior-level
+        # programs that may not work at this level. Thompson naturally
+        # explores: at a new level with no per-level evidence yet, all
+        # promoted programs have similar Beta(1,1) ≈ uniform sampling.
+        # As the brain tries each and they fail (register_failure on
+        # observe), their per-level posteriors sharpen down.
         if promoted_programs:
-            for prog in promoted_programs[:3]:  # top-3 by confidence
-                sig, next_prog = prog.step(state)
+            # Sample-rank promoted programs by Thompson over the substrate
+            # signature of their FIRST action (we can't easily ask the
+            # substrate about a multi-step program directly).
+            best_promoted_score = -float("inf")
+            best_promoted = None
+            best_promoted_id = None
+            for prog in promoted_programs:
+                try:
+                    sig, _ = prog.step(state)
+                    # Use the program's id and current state.level to look
+                    # up a per-program-per-level Beta. For v0 we use the
+                    # substrate signature of the first resolved action as
+                    # a proxy.
+                    a = encoder.resolve(sig, state, candidates)
+                    if a is None:
+                        continue
+                    action_sig = self._signature(a, state)
+                    n_obs, n_goal = self._action_table.counts.get(
+                        action_sig, (0, 0))
+                    alpha = max(0.01, n_goal + 1.0)
+                    beta = max(0.01, n_obs - n_goal + 1.0)
+                    v = self._rng.betavariate(alpha, beta)
+                    if v > best_promoted_score:
+                        best_promoted_score = v
+                        best_promoted = prog
+                        best_promoted_id = id(prog)
+                except Exception:
+                    continue
+            if best_promoted is not None:
+                sig, next_prog = best_promoted.step(state)
                 action = encoder.resolve(sig, state, candidates)
                 if action is not None:
                     self._in_flight = next_prog
-                    self._in_flight_id = id(prog)
+                    self._in_flight_id = best_promoted_id
+                    self._in_flight_start_level = state.level
+                    self._in_flight_scored = False
                     return action
 
         # 2. Substrate Thompson + lookahead per atomic candidate
         best_score = -float("inf")
         best_action = None
-        current_facts = encoder.encode(state)
+        # Bug #4 fix: pass last_state as `before` to get delta facts.
+        # When last_state is None (start of attempt) we encode static-only.
+        try:
+            current_facts = encoder.encode(state, before=last_state)
+        except TypeError:
+            # Encoder doesn't accept before kwarg (legacy) — fall back
+            current_facts = encoder.encode(state)
         # Current critic distance (state-level)
         current_d = self._goals_distance(current_facts, critic_goals)
 
         for a in candidates:
             sig = self._signature(a, state)
-            n_obs, n_goal = self._substrate.get(sig, (0.0, 0.0))
+            n_obs, n_goal = self._action_table.counts.get(sig, (0, 0))
             alpha = max(0.01, n_goal + 1.0)
             beta = max(0.01, n_obs - n_goal + 1.0)
             thompson = self._rng.betavariate(alpha, beta)
@@ -218,24 +325,14 @@ class CommitMonitorPlanner:
 
     @staticmethod
     def _signature(action: ActionLike, state: StateLike) -> tuple:
-        """Compact action signature for substrate posterior.
+        """Compact action signature — DELEGATES to ActionScoreTable._signature.
 
-        (action_kind, target_color, level). For clicks, target_color is the
-        color of the entity at the click position (or 'empty' if none).
-        For keys/spacebar/undo, target_color is None.
+        Bug #1 fix: keep signature identical to the one used by
+        MemoryBrainResidual / ActionScoreTable so the substrate posterior
+        is keyed consistently across Curiosity and Planner. Single source
+        of truth: ActionScoreTable._signature.
         """
-        kind = action[0] if action else "unknown"
-        level = getattr(state, "level", 0)
-        target_color = None
-        if kind == "click" and len(action) >= 3:
-            x, y = int(action[1]), int(action[2])
-            for e in state.entities:
-                if (y, x) in e.region.cells:
-                    target_color = int(e.color)
-                    break
-            if target_color is None:
-                target_color = "empty"
-        return (kind, target_color, level)
+        return ActionScoreTable._signature(action, state)
 
     @staticmethod
     def _goals_distance(facts_or_state, goals) -> float:

@@ -144,26 +144,42 @@ class MemoryBrainResidual:
             return 0.0
         return sum(contributions) / len(contributions)
 
-    def observe(self, transition: Transition) -> None:
+    def observe(self, transition: Transition,
+                precomputed_surprise: float | None = None) -> float:
+        """Update substrate + WM. Return signed surprise (clipped).
+
+        If precomputed_surprise is provided, use it instead of recomputing —
+        the composer can compute surprise ONCE BEFORE the WM update and pass
+        it here, so the substrate-injection uses the same signal everyone
+        else sees. Returns the clipped surprise value used for injection
+        (0.0 when scored or before is None).
+        """
         self._observed_count += 1
         self._rep.update(transition)
-        # 1. Substrate update: standard action-signature posterior on score events.
+        # 1. Compute signed surprise FIRST (against current WM, before update).
+        #    Composer can supply this to avoid the double-computation
+        #    (audit bug #2).
+        if precomputed_surprise is not None:
+            surprise = precomputed_surprise
+        elif transition.before is not None:
+            surprise = self._compute_signed_surprise(
+                transition.before, transition.action, transition.after,
+            )
+        else:
+            surprise = 0.0
+        # 2. Substrate update: standard action-signature posterior on score events.
         self._action_table.observe(transition)
-        # 2. World model learns P(fact | context). Dense signal.
+        # 3. World model learns P(fact | context). Dense signal.
         self._world.observe(transition.before, transition.action,
                             transition.after)
-        # 3. Compute signed surprise. Only inject if no score event fired
-        #    (score events already contributed integer +1 to α; don't double-credit).
+        # 4. Inject surprise as fractional credit (if no score event).
         scored = False
         for e in transition.events:
             if e.kind in (EVENT_SCORE_INCREASED, EVENT_LEVEL_INCREASED):
                 scored = True
                 break
         if scored or transition.before is None:
-            return
-        surprise = self._compute_signed_surprise(
-            transition.before, transition.action, transition.after
-        )
+            return 0.0
         # Clip to bound per-transition influence; score events still dominate.
         surprise_clipped = max(-SURPRISE_CLIP, min(SURPRISE_CLIP, surprise))
         # Inject as fractional credit to the action's signature.
@@ -181,6 +197,7 @@ class MemoryBrainResidual:
         # Fixation instrumentation
         s_sum, s_n = self._surprise_log[sig]
         self._surprise_log[sig] = (s_sum + surprise_clipped, s_n + 1)
+        return surprise_clipped
 
     def act(self, state: State, budget: ComputeBudget) -> Action:
         """Pure Thompson sampling over the action-signature posterior.
