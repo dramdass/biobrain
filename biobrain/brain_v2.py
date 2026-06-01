@@ -63,6 +63,25 @@ class BioBrainV2:
         )
         # Track last seen state for cold-path encoder delta facts (bug #4)
         self._last_state: Optional[StateLike] = None
+        # v0.3 — flag to set SearchGraph root once per game
+        self._search_root_set: bool = False
+
+    @staticmethod
+    def _quadrant_of_entity(entity) -> int:
+        """4x4 grid quadrant of entity centroid → 0..15. Place primitive.
+
+        Mirrors prism.predicate_pool._quadrant_of but takes an entity
+        object rather than raw cells. v0.3 — needed for fingerprint
+        computation in observe() and act().
+        """
+        cells = list(entity.region.cells) if entity.region.cells else []
+        if not cells:
+            return 0
+        cy = sum(c[0] for c in cells) / len(cells)
+        cx = sum(c[1] for c in cells) / len(cells)
+        by = min(3, max(0, int(cy // 16)))
+        bx = min(3, max(0, int(cx // 16)))
+        return by * 4 + bx
 
     # ============================================================ lifecycle
 
@@ -79,6 +98,7 @@ class BioBrainV2:
             action_table=self._residual._action_table,
         )
         self._last_state = None
+        self._search_root_set = False
 
     def reset_attempt(self) -> None:
         self._residual.reset_attempt()
@@ -108,6 +128,37 @@ class BioBrainV2:
           7. Planner.observe with the same surprise (no double-write).
           8. Fire on_level_change hook if applicable.
         """
+        # v0.3 — set the SearchGraph root once per game (first valid observation)
+        if (transition.before is not None
+                and not self._search_root_set):
+            self.planner.search_graph.set_root(
+                int(transition.before.grid_hash))
+            self._search_root_set = True
+
+        # v0.3 — compute n_cells_changed_elsewhere for role-counter updates.
+        # Used by Salience to identify "selector"-class actions.
+        n_cells_changed_elsewhere = 0
+        if transition.before is not None and transition.action is not None:
+            try:
+                import numpy as np
+                g_before = np.asarray(transition.before.raw_grid)
+                g_after = np.asarray(transition.after.raw_grid)
+                if g_before.shape == g_after.shape:
+                    diff_mask = g_before != g_after
+                    # For clicks, subtract cells near the click position so
+                    # only "elsewhere" changes count.
+                    if (transition.action[0] == "click"
+                            and len(transition.action) >= 3):
+                        x, y = int(transition.action[1]), int(transition.action[2])
+                        for r in range(max(0, y - 1),
+                                        min(g_before.shape[0], y + 2)):
+                            for c in range(max(0, x - 1),
+                                            min(g_before.shape[1], x + 2)):
+                                diff_mask[r, c] = False
+                    n_cells_changed_elsewhere = int(diff_mask.sum())
+            except Exception:
+                pass
+
         # Compute surprise ONCE (before WM update)
         precomputed_surprise = 0.0
         if transition.before is not None and transition.action is not None:
@@ -149,6 +200,38 @@ class BioBrainV2:
                 actual_facts=actual_facts,
             )
 
+        # v0.3 — role-counter and fingerprint machinery
+        self.salience.update_causal_counters(
+            transition, n_cells_changed_elsewhere=n_cells_changed_elsewhere)
+        self.salience.refresh_role_assignments()
+        if transition.before is not None and transition.action is not None:
+            fp_before = self.salience.current_fingerprint(
+                transition.before,
+                quadrant_of=self._quadrant_of_entity)
+            fp_after = self.salience.current_fingerprint(
+                transition.after,
+                quadrant_of=self._quadrant_of_entity)
+            # Critic-distance drop as validation channel
+            try:
+                from biobrain.critic.base import state_distance_to_goals
+                d_before = state_distance_to_goals(
+                    transition.before,
+                    self.critic.evaluate(transition.before))
+                d_after = state_distance_to_goals(
+                    transition.after,
+                    self.critic.evaluate(transition.after))
+                critic_dropped = d_after < d_before
+            except Exception:
+                critic_dropped = False
+            self.salience.detect_subgoal(
+                fingerprint_before=fp_before,
+                fingerprint_after=fp_after,
+                action=transition.action,
+                critic_distance_dropped=critic_dropped,
+                source_level=transition.after.level,
+                source_attempt_id=0,  # v0.3 — composer doesn't track yet
+            )
+
         # Critic history update
         self.critic.observe_transition(transition)
 
@@ -172,6 +255,8 @@ class BioBrainV2:
                 scored=scored,
                 current_level=transition.after.level,
                 ledger=self.ledger,
+                transition=transition,  # v0.3 — for SearchGraph edge recording
+                attempt_id=0,            # v0.3 — composer doesn't track yet
             )
 
         # Level change hook
@@ -196,6 +281,15 @@ class BioBrainV2:
         except Exception:
             pass
         affordance_fn = self.salience.get_affordance
+        # v0.3 — look up transferred subgoals via fingerprint index
+        transferred_subgoals: list = []
+        try:
+            fp_current = self.salience.current_fingerprint(
+                state, quadrant_of=self._quadrant_of_entity)
+            transferred_subgoals = self.salience.fingerprint_index.lookup(
+                fp_current)
+        except Exception:
+            transferred_subgoals = []
         return self.planner.act(
             state=state,
             candidates=candidates,
@@ -206,6 +300,7 @@ class BioBrainV2:
             affordance_fn=affordance_fn,
             last_state=self._last_state,
             ledger=self.ledger,
+            transferred_subgoals=transferred_subgoals,  # v0.3
         )
 
     def end_of_attempt(self) -> None:
