@@ -168,6 +168,7 @@ class CommitMonitorPlanner:
             affordance_fn=None,
             last_state: Optional[StateLike] = None,
             ledger=None,
+            transferred_subgoals: Optional[list] = None,
             ) -> ActionLike:
         """Single entry point. Routes to hot or cold path based on state.
 
@@ -200,7 +201,8 @@ class CommitMonitorPlanner:
         # COLD path: full reasoning
         return self._cold_path(state, candidates, encoder,
                                 critic_goals, promoted_programs,
-                                simulator, affordance_fn, last_state, ledger)
+                                simulator, affordance_fn, last_state, ledger,
+                                transferred_subgoals)
 
     def _on_program_complete(self, ledger, current_level: int,
                               was_aborted: bool = False) -> None:
@@ -240,6 +242,7 @@ class CommitMonitorPlanner:
                     affordance_fn,
                     last_state: Optional[StateLike] = None,
                     ledger=None,
+                    transferred_subgoals: Optional[list] = None,
                     ) -> ActionLike:
         """Full reasoning: Thompson + Critic + Simulator + Ledger + Affordance."""
         self._n_cold_calls += 1
@@ -306,6 +309,27 @@ class CommitMonitorPlanner:
         # Current critic distance (state-level)
         current_d = self._goals_distance(current_facts, critic_goals)
 
+        # v0.3 — compute first-action sets for pragmatic bonus lookup.
+        # Each promoted Program's first step yields an ActionSig; resolve
+        # to a concrete Action against the candidate pool for comparison.
+        promoted_first_actions: set = set()
+        if promoted_programs:
+            for prog in promoted_programs:
+                try:
+                    sig, _ = prog.step(state)
+                    a_first = encoder.resolve(sig, state, candidates)
+                    if a_first is not None:
+                        promoted_first_actions.add(tuple(a_first))
+                except Exception:
+                    continue
+        # Transferred subgoals come from the Salience fingerprint index
+        # (passed in via kwarg). Default to empty set when not provided.
+        transferred_first_actions: set = set()
+        if transferred_subgoals:
+            for sg in transferred_subgoals:
+                if sg.action_subsequence:
+                    transferred_first_actions.add(tuple(sg.action_subsequence[0]))
+
         for a in candidates:
             sig = self._signature(a, state)
             n_obs, n_goal = self._action_table.counts.get(sig, (0, 0))
@@ -333,7 +357,29 @@ class CommitMonitorPlanner:
                 kind = a[0] if a else "unknown"
                 affordance_bonus = (affordance_fn(kind) - 0.5) * 0.2
 
-            score = thompson + lookahead_bonus + affordance_bonus
+            # v0.3 — EV-augmented scoring per spec §4.2
+            parent_hash = int(getattr(state, "grid_hash", 0))
+            action_sig_for_graph = self._signature(a, state)
+            child_hash = self.search_graph.child(parent_hash, action_sig_for_graph)
+            # Epistemic — info gain (unexpanded edges scored high)
+            epistemic = self._epistemic_score(parent_hash, action_sig_for_graph,
+                                                symbolic_surprise=lookahead_bonus)
+            # Pragmatic — progress toward goals + macro/subgoal first-step bonuses
+            # NOTE: predicted_d here is the existing `current_d - lookahead_bonus`
+            # — we invert the cached delta to feed _pragmatic_score
+            pragmatic = self._pragmatic_score(
+                action=a,
+                current_d=current_d,
+                predicted_d=(current_d - lookahead_bonus),
+                promoted_first_actions=promoted_first_actions,
+                transferred_first_actions=transferred_first_actions,
+            )
+            # Empowerment — control over reachable future from child
+            empowerment = self._empowerment_score(child_hash, depth=2)
+
+            # Equal weights for v0; RL-TODO: learn the weights
+            ev = (epistemic + pragmatic + empowerment) / 3.0
+            score = thompson + ev + affordance_bonus
             if score > best_score:
                 best_score = score
                 best_action = a
@@ -370,6 +416,58 @@ class CommitMonitorPlanner:
         if weight_total == 0:
             return 0.5
         return weighted_sum / weight_total
+
+    # ----------------------------------------------------------- EV scoring
+
+    def _epistemic_score(self, parent_hash: int, action_sig: tuple,
+                          symbolic_surprise: float) -> float:
+        """Epistemic = expected information gain.
+
+        Unexpanded edges get a high prior (1.0); expanded edges get the
+        WM's expected surprise. Bounded [0, 1].
+        """
+        if self.search_graph.child(parent_hash, action_sig) is None:
+            # Unexpanded — high epistemic value
+            return 1.0
+        # Expanded — use the symbolic WM's surprise expectation, clipped
+        return max(0.0, min(1.0, abs(symbolic_surprise)))
+
+    def _pragmatic_score(self, action, current_d: float,
+                          predicted_d: float,
+                          promoted_first_actions: set,
+                          transferred_first_actions: set) -> float:
+        """Pragmatic = progress toward known goals.
+
+        Combines:
+          (a) Critic-distance reduction via 1-step lookahead;
+          (b) bonus if action is the first step of a promoted macro;
+          (c) bonus if action is the first step of a transferred subgoal.
+        """
+        d_reduction = max(0.0, current_d - predicted_d)
+        a_first = tuple(action)
+        # RL-TODO: 0.3 macro/subgoal first-step bonuses are hand-set.
+        # Could be derived from per-game macro success rates.
+        macro_bonus = 0.3 if a_first in promoted_first_actions else 0.0
+        subgoal_bonus = 0.3 if a_first in transferred_first_actions else 0.0
+        return d_reduction + macro_bonus + subgoal_bonus
+
+    def _empowerment_score(self, child_hash, depth: int = 2) -> float:
+        """Empowerment = |reachable states from child within depth K|.
+
+        Normalized by a coarse upper bound. Returns ∈ [0, 1].
+        Returns 0 if child is None (unexpanded edge) or is terminal.
+        """
+        if child_hash is None:
+            return 0.0
+        if child_hash not in self.search_graph._nodes:
+            return 0.0
+        node = self.search_graph.node_metadata(child_hash)
+        if node and node.is_terminal:
+            return 0.0
+        n_reachable = self.search_graph.reachable_count(child_hash, depth)
+        # RL-TODO: normalization constant 50.0 is a coarse bound. Could
+        # be derived from observed reachable-count distribution per game.
+        return min(1.0, n_reachable / 50.0)
 
     # ----------------------------------------------------------- diagnostics
 
