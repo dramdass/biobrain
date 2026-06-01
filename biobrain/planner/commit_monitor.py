@@ -30,6 +30,7 @@ from typing import Optional
 
 from biobrain.curiosity.residual import SURPRISE_CLIP
 from biobrain.planner.posterior import ActionScoreTable
+from biobrain.planner.search_graph import SearchGraph
 from biobrain.protocols import ActionLike, StateLike
 from biobrain.motor_cortex.core import Program
 
@@ -76,6 +77,8 @@ class CommitMonitorPlanner:
         # we create our own (standalone usage / tests).
         self._action_table = action_table if action_table is not None \
             else ActionScoreTable()
+        # v0.3 — within-game reachable-state graph (persists across attempts)
+        self.search_graph = SearchGraph(max_nodes=10_000)
         # Diagnostic counters
         self._n_cold_calls = 0
         self._n_hot_calls = 0
@@ -91,6 +94,8 @@ class CommitMonitorPlanner:
         self._rng = random.Random(self._seed)
         self._n_cold_calls = 0
         self._n_hot_calls = 0
+        # NEW v0.3: reset the within-game search graph
+        self.search_graph.reset_game()
         # NOTE: we do NOT reset the action_table here — that's owned by
         # the composer (shared with Residual). Composer's reset_game
         # handles it via residual.reset_game().
@@ -114,7 +119,10 @@ class CommitMonitorPlanner:
 
     def observe(self, surprise: float, action_sig: tuple,
                 scored: bool, current_level: int = 0,
-                ledger=None) -> None:
+                ledger=None,
+                transition=None,    # NEW v0.3
+                attempt_id: int = 0  # NEW v0.3
+                ) -> None:
         """Update violation flag; track in-flight program scoring.
 
         Substrate update is handled UPSTREAM in MemoryBrainResidual.observe
@@ -127,6 +135,17 @@ class CommitMonitorPlanner:
         Note: action_sig is kept for backward compat / diagnostics; the
         substrate update happens elsewhere now.
         """
+        # v0.3 — record the transition's edge in the SearchGraph
+        if transition is not None and transition.before is not None:
+            self.search_graph.add_edge(
+                parent_hash=int(transition.before.grid_hash),
+                action_key=action_sig,
+                child_hash=int(transition.after.grid_hash),
+                attempt_id=attempt_id,
+            )
+            if scored:
+                self.search_graph.mark_scoring(
+                    int(transition.after.grid_hash), attempt_id)
         if scored:
             self._in_flight_scored = True
         # Violation detection — gate cold-path re-engagement
