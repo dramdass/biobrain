@@ -182,3 +182,30 @@ These determine whether biobrain reaches human-level or hits a structural ceilin
 5. **Affordance prior — accept gap or relax covenant?** Slot exists.
    Strict default. Adapter-supplied priors available if we ever decide
    covenant-relaxation is worth it. Decision deferred.
+
+---
+
+## Phase 5 — Within-game search ✓ BUILT (Phase 1 of God Mode)
+
+Per spec `docs/superpowers/specs/2026-06-01-within-game-search-design.md`.
+
+**Built:**
+- 10-role Spelke-grounded catalogue with likelihood-based assignment (`biobrain.salience.roles`)
+- 3-granularity fingerprint computation + index (`biobrain.salience.fingerprint`)
+- Subgoal detector via fingerprint-delta + Critic-validation channel (`biobrain.salience.subgoals`)
+- Within-game reachable-state graph (`biobrain.planner.search_graph`)
+- Cold-path EV decision: `epistemic + pragmatic + empowerment` (equal weights v0)
+- Composer wiring through `BioBrainV2` (n_cells_changed_elsewhere, role refresh, subgoal detect, transferred-subgoal lookup, graph root set, transition+attempt_id plumbed)
+
+**Verified:**
+- 92 unit tests passing
+- cd82 role assignment probe: selectors correctly tagged as `SELECTOR`; framing tagged as `STATIC`
+- vc33 e2e probe (5 attempts × 100 steps): graph grew 78→247 nodes; fingerprint index 8→56; role assignments 22→35 across attempts; 4/5 attempts scored at Level 1; persistence working
+- lp85 e2e probe (5 × 100 steps): graph 14→82; index 4→14; roles 78→125; 4/5 attempts scored
+
+**Open questions deferred to v0.4:**
+- Macro composition (subgoals are atomic units; composing into longer plans is future work)
+- Empowerment depth K tuning (started at K=2)
+- Role-discovery K threshold tuning (started at K=5)
+- RL learning of EV term weights (currently equal-weighted)
+- Reaching Level 2+ within the action budget (the depth bet from God Mode)

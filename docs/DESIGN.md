@@ -52,6 +52,17 @@ designed to run against any environment via an **adapter** that supplies
 | 9 | Level transitions: implicit-by-context + explicit `on_level_change` hook for Ledger/Planner/Salience |
 | 10 | Staging: big-bang v0.2 refactor; push when all 8 work together |
 
+**v0.3 additions (within-game search):**
+
+The Planner gains a `SearchGraph` submodule (within-game reachable-state
+graph; persists across attempts). Salience gains role discovery,
+fingerprint computation, and the `RoleFingerprintIndex`. Component count
+stays at 8.
+
+See `docs/superpowers/specs/2026-06-01-within-game-search-design.md` for
+the full spec and `docs/superpowers/plans/2026-06-01-within-game-search.md`
+for the implementation plan.
+
 ---
 
 ## 2. Per-component responsibilities

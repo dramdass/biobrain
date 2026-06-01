@@ -91,6 +91,13 @@ What's novel: salience-triggered fine-grained perception, where granularity adap
 
 What's novel: Salience as central organ, not a perception utility. The phenomenology insight (humans don't separately "do salience" and "infer latents" — they do one integrated thing) is the strongest evidence for this architectural shape.
 
+**v0.3 additions:**
+- Per-entity causal counters (`RoleSignature`) updated per `observe()`
+- 10-role Spelke-grounded catalogue with likelihood-based assignment
+- 3-granularity fingerprint computation (`F_tight` / `F_mid` / `F_loose`)
+- `RoleFingerprintIndex` for subgoal storage and cross-level lookup
+- Subgoal detection via fingerprint-delta with Critic-validation channel
+
 ---
 
 ## 4. Curiosity (Bayesian World Model + ICM)
@@ -239,6 +246,16 @@ What's novel: trajectory abstraction + hierarchical Beta + per-(program, level) 
 - ARC-3: Most agents are per-step. Event-driven commit-and-monitor is novel.
 
 What's novel: three-path separation (hot/warm/cold) where each path does the work appropriate at its temporal scale, justified by the phenomenology and the budget constraint.
+
+**v0.3 additions:**
+- `SearchGraph` submodule: nodes by `grid_hash`, edges by action-key,
+  unexpanded frontier tracking, terminal/scoring flags, LRU eviction at
+  10K nodes
+- Cold-path decision: `epistemic + pragmatic + empowerment` EV
+  (equal weights v0; RL-TODO for learned weights)
+- First-action bonus for promoted macros and transferred subgoals
+- `observe()` accepts `transition` + `attempt_id` kwargs and records
+  graph edges; marks scoring nodes on score events
 
 ---
 
